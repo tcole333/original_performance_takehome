@@ -274,6 +274,14 @@ class KernelBuilder:
         tmp_addr5 = self.alloc_scratch("tmp_addr5")
         tmp_addr6 = self.alloc_scratch("tmp_addr6")
 
+        # Pre-computed load addresses for next iteration (enables Load||Store||XOR overlap)
+        next_load_addr = self.alloc_scratch("next_load_addr")
+        next_load_addr2 = self.alloc_scratch("next_load_addr2")
+        next_load_addr3 = self.alloc_scratch("next_load_addr3")
+        next_load_addr4 = self.alloc_scratch("next_load_addr4")
+        next_load_addr5 = self.alloc_scratch("next_load_addr5")
+        next_load_addr6 = self.alloc_scratch("next_load_addr6")
+
         # Scratch space addresses for memory layout
         init_vars = [
             "rounds",
@@ -392,29 +400,33 @@ class KernelBuilder:
                     ("^", v_val[2], v_val[2], v_node_val[2]),
                 ]})
 
+                # Pre-compute load addresses for first steady state iteration (iter 1)
+                first_next_batch_bases = [super_stride, super_stride + VLEN, super_stride + 2 * VLEN]
+                first_next_i_consts = [self.scratch_const(bb) for bb in first_next_batch_bases]
+                body.append({"alu": [
+                    ("+", next_load_addr, self.scratch["inp_indices_p"], first_next_i_consts[0]),
+                    ("+", next_load_addr2, self.scratch["inp_values_p"], first_next_i_consts[0]),
+                    ("+", next_load_addr3, self.scratch["inp_indices_p"], first_next_i_consts[1]),
+                    ("+", next_load_addr4, self.scratch["inp_values_p"], first_next_i_consts[1]),
+                    ("+", next_load_addr5, self.scratch["inp_indices_p"], first_next_i_consts[2]),
+                    ("+", next_load_addr6, self.scratch["inp_values_p"], first_next_i_consts[2]),
+                ]})
+
                 # ===== STEADY STATE: Overlap hash(N) with gather(N+1) =====
                 for iter_idx in range(num_super_iters - 1):
                     curr_base = iter_idx * super_stride
                     next_base = (iter_idx + 1) * super_stride
+                    next_next_base = (iter_idx + 2) * super_stride
                     curr_batch_bases = [curr_base, curr_base + VLEN, curr_base + 2 * VLEN]
                     next_batch_bases = [next_base, next_base + VLEN, next_base + 2 * VLEN]
-                    next_i_consts = [self.scratch_const(bb) for bb in next_batch_bases]
+                    next_next_batch_bases = [next_next_base, next_next_base + VLEN, next_next_base + 2 * VLEN]
+                    next_next_i_consts = [self.scratch_const(bb) for bb in next_next_batch_bases]
                     curr_i_consts = [self.scratch_const(bb) for bb in curr_batch_bases]
 
-                    # Load addresses for NEXT iteration (overlapped with nothing yet)
-                    body.append({"alu": [
-                        ("+", tmp_addr, self.scratch["inp_indices_p"], next_i_consts[0]),
-                        ("+", tmp_addr2, self.scratch["inp_values_p"], next_i_consts[0]),
-                        ("+", tmp_addr3, self.scratch["inp_indices_p"], next_i_consts[1]),
-                        ("+", tmp_addr4, self.scratch["inp_values_p"], next_i_consts[1]),
-                        ("+", tmp_addr5, self.scratch["inp_indices_p"], next_i_consts[2]),
-                        ("+", tmp_addr6, self.scratch["inp_values_p"], next_i_consts[2]),
-                    ]})
-
-                    # vload for NEXT iteration
-                    body.append({"load": [("vload", v_idx_n[0], tmp_addr), ("vload", v_val_n[0], tmp_addr2)]})
-                    body.append({"load": [("vload", v_idx_n[1], tmp_addr3), ("vload", v_val_n[1], tmp_addr4)]})
-                    body.append({"load": [("vload", v_idx_n[2], tmp_addr5), ("vload", v_val_n[2], tmp_addr6)]})
+                    # vload for NEXT iteration using pre-computed addresses
+                    body.append({"load": [("vload", v_idx_n[0], next_load_addr), ("vload", v_val_n[0], next_load_addr2)]})
+                    body.append({"load": [("vload", v_idx_n[1], next_load_addr3), ("vload", v_val_n[1], next_load_addr4)]})
+                    body.append({"load": [("vload", v_idx_n[2], next_load_addr5), ("vload", v_val_n[2], next_load_addr6)]})
 
                     for vi in range(3):
                         body.append({"debug": [
@@ -495,13 +507,22 @@ class KernelBuilder:
                             ("vcompare", v_idx[vi], tuple((round, curr_batch_bases[vi] + j, "wrapped_idx") for j in range(VLEN)))
                         ]})
 
-                    # Store CURRENT || XOR for NEXT (first cycle overlapped)
+                    # Store CURRENT || XOR for NEXT || Pre-compute load addrs for NEXT-NEXT
+                    # All three use different engines: STORE, VALU, ALU
                     body.append({
                         "store": [("vstore", tmp_addr, v_idx[0]), ("vstore", tmp_addr2, v_val[0])],
                         "valu": [
                             ("^", v_val_n[0], v_val_n[0], v_node_val_n[0]),
                             ("^", v_val_n[1], v_val_n[1], v_node_val_n[1]),
                             ("^", v_val_n[2], v_val_n[2], v_node_val_n[2]),
+                        ],
+                        "alu": [
+                            ("+", next_load_addr, self.scratch["inp_indices_p"], next_next_i_consts[0]),
+                            ("+", next_load_addr2, self.scratch["inp_values_p"], next_next_i_consts[0]),
+                            ("+", next_load_addr3, self.scratch["inp_indices_p"], next_next_i_consts[1]),
+                            ("+", next_load_addr4, self.scratch["inp_values_p"], next_next_i_consts[1]),
+                            ("+", next_load_addr5, self.scratch["inp_indices_p"], next_next_i_consts[2]),
+                            ("+", next_load_addr6, self.scratch["inp_values_p"], next_next_i_consts[2]),
                         ]
                     })
                     body.append({"store": [("vstore", tmp_addr3, v_idx[1]), ("vstore", tmp_addr4, v_val[1])]})
