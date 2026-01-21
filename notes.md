@@ -19,21 +19,25 @@
 - valu for all hash computations (same cycles, 8x throughput)
 - vselect for conditional operations
 
+### Optimization 3: Better VLIW Packing in SIMD
+- **Cycles:** 14,414 (10.25x speedup over baseline, 1.21x over opt 2)
+- Pack idx/val vloads into same cycle (4 → 2 cycles)
+- Hoist v_forest_p broadcast out of loop (saves 1 cycle × 512 iterations)
+- Pack % and * operations together (2 → 1 cycle)
+- Pack vstores into same cycle (4 → 2 cycles)
+
 ---
 
 ## Ideas to Try Next
 
 ### High Priority
-1. **More VLIW Packing in SIMD** - Current SIMD code has sequential dependencies we can break
-   - Pack vload for idx and val into same cycle (they're independent)
-   - Pack more valu operations together
-
-2. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
+1. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
+2. **Software Pipelining** - Overlap iterations (start next vload while computing current)
 
 ### Medium Priority
-3. **Software Pipelining** - Overlap iterations (start next vload while computing current)
-4. **Reduce Redundant Broadcasts** - v_forest_p broadcast repeated every iteration
+3. **Fused Operations** - Use multiply_add where applicable in hash
+4. **More ALU/VALU Packing** - Look for other independent operations
 
 ### Lower Priority / Speculative
-5. **Better Gather Pattern** - Sort batch by tree index to improve locality
-6. **Fused Operations** - Use multiply_add where applicable
+5. **Better Gather Pattern** - Sort batch by tree index (complex, likely not worth it)
+6. **Precompute batch_base constants** - Minor optimization

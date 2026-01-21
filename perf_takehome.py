@@ -162,6 +162,7 @@ class KernelBuilder:
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
         tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")  # For parallel address computation
 
         # Scratch space addresses for memory layout
         init_vars = [
@@ -202,6 +203,10 @@ class KernelBuilder:
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
 
+        # Broadcast forest_values_p once (hoisted out of loop)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
+
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting SIMD loop"))
 
@@ -212,32 +217,31 @@ class KernelBuilder:
             for batch_base in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(batch_base)
 
-                # === Load idx[batch_base:batch_base+8] with vload ===
-                # Compute base address: inp_indices_p + batch_base
-                body.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"], i_const)]})
-                body.append({"load": [("vload", v_idx, tmp_addr)]})
+                # === VLIW Pack: Load idx and val in parallel ===
+                # Compute both addresses (1 cycle)
                 body.append({
-                    "debug": [
-                        ("vcompare", v_idx, tuple((round, batch_base + j, "idx") for j in range(VLEN)))
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
                     ]
                 })
-
-                # === Load val[batch_base:batch_base+8] with vload ===
-                body.append({"alu": [("+", tmp_addr, self.scratch["inp_values_p"], i_const)]})
-                body.append({"load": [("vload", v_val, tmp_addr)]})
+                # Both vloads in same cycle (SLOT_LIMITS["load"] = 2)
+                body.append({
+                    "load": [
+                        ("vload", v_idx, tmp_addr),
+                        ("vload", v_val, tmp_addr2),
+                    ]
+                })
                 body.append({
                     "debug": [
-                        ("vcompare", v_val, tuple((round, batch_base + j, "val") for j in range(VLEN)))
+                        ("vcompare", v_idx, tuple((round, batch_base + j, "idx") for j in range(VLEN))),
+                        ("vcompare", v_val, tuple((round, batch_base + j, "val") for j in range(VLEN))),
                     ]
                 })
 
                 # === Gather: compute addresses for forest lookup ===
                 # v_addr[j] = forest_values_p + v_idx[j]
-                # Need to broadcast forest_values_p to vector first
-                v_forest_p = self.alloc_scratch("v_forest_p", VLEN) if "v_forest_p" not in self.scratch else self.scratch["v_forest_p"]
-                if "v_forest_p" not in self.scratch:
-                    self.scratch["v_forest_p"] = v_forest_p
-                body.append({"valu": [("vbroadcast", v_forest_p, self.scratch["forest_values_p"])]})
+                # v_forest_p already broadcast before loop
                 body.append({"valu": [("+", v_addr, v_forest_p, v_idx)]})
 
                 # === 8 scalar loads for gather (2 per cycle = 4 cycles) ===
@@ -264,14 +268,17 @@ class KernelBuilder:
                 })
 
                 # === idx = 2*idx + (1 if val % 2 == 0 else 2) ===
-                # v_tmp1 = v_val % 2
-                body.append({"valu": [("%", v_tmp1, v_val, v_two)]})
+                # VLIW Pack: % and * are independent (1 cycle)
+                body.append({
+                    "valu": [
+                        ("%", v_tmp1, v_val, v_two),
+                        ("*", v_idx, v_idx, v_two),
+                    ]
+                })
                 # v_tmp1 = (v_tmp1 == 0)
                 body.append({"valu": [("==", v_tmp1, v_tmp1, v_zero)]})
                 # v_tmp3 = select(v_tmp1, 1, 2)
                 body.append({"flow": [("vselect", v_tmp3, v_tmp1, v_one, v_two)]})
-                # v_idx = v_idx * 2
-                body.append({"valu": [("*", v_idx, v_idx, v_two)]})
                 # v_idx = v_idx + v_tmp3
                 body.append({"valu": [("+", v_idx, v_idx, v_tmp3)]})
                 body.append({
@@ -289,12 +296,21 @@ class KernelBuilder:
                     ]
                 })
 
-                # === Store results with vstore ===
-                body.append({"alu": [("+", tmp_addr, self.scratch["inp_indices_p"], i_const)]})
-                body.append({"store": [("vstore", tmp_addr, v_idx)]})
-
-                body.append({"alu": [("+", tmp_addr, self.scratch["inp_values_p"], i_const)]})
-                body.append({"store": [("vstore", tmp_addr, v_val)]})
+                # === VLIW Pack: Store results with vstore ===
+                # Compute both addresses (1 cycle)
+                body.append({
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
+                    ]
+                })
+                # Both vstores in same cycle (SLOT_LIMITS["store"] = 2)
+                body.append({
+                    "store": [
+                        ("vstore", tmp_addr, v_idx),
+                        ("vstore", tmp_addr2, v_val),
+                    ]
+                })
 
         self.instrs.extend(body)
         self.instrs.append({"flow": [("pause",)]})
