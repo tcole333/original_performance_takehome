@@ -91,6 +91,9 @@
 
 ### Session 2 (Multi-vector pipelining)
 - 3-vector VALU parallelism: → 7,822 cycles (18.9x over baseline)
-  - Uses all 6 VALU slots during hash stages
-  - Processes 24 items per super-iteration
-  - Bottleneck now is gather (12 cycles for 24 load_offsets)
+- vselect→arithmetic: → 7,182 cycles (20.6x) - replace vselect with * and -
+- Software pipelining: → 5,454 cycles (27.1x) - overlap Hash(N) with Gather(N+1)
+- Bitwise AND: → 5,262 cycles (28.1x) - replace (val%2==0)?1:2 with 1+(val&1)
+- Store||XOR: → 5,118 cycles (28.9x) - overlap store with XOR
+- Triple engine overlap: → 4,991 cycles (29.6x) - Store||XOR||LoadAddrs
+  - Bottleneck: Hash||Gather overlap (12 cycles), index update (5 cycles)
