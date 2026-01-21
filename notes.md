@@ -34,50 +34,38 @@
 
 ---
 
-## Ideas to Try Next
-
-### High Priority
-1. **Software Pipelining** - Prefetch next iteration's idx/val during hash phase
-   - Hash phase is ~12 cycles with LOAD unit idle
-   - Could load next iteration's data during this time
-   - Requires double-buffering registers (v_idx/v_idx_next)
-   - Attempted but incomplete - need to actually USE prefetched values
-
-2. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
-
-### Medium Priority
-3. **Fused Operations** - Use multiply_add where applicable in hash
-4. **Pack more across engines** - Look for other flow/alu/valu overlaps
-
-### Lower Priority / Speculative
-5. **Better Gather Pattern** - Sort batch by tree index (complex, indices diverge each round)
-6. **Reduce hash stages** - Algorithmic change, may not preserve semantics
-
-### Ideas Evaluated and Rejected
-- **Shuffle/repack for contiguous gathers** - No native sort primitives, indices diverge after each hash, overhead would exceed benefit
-
----
-
 ## Optimization Backlog (Track Across Sessions)
 
+### Completed
+- [x] 3-vector VALU parallelism - use all 6 VALU slots during hash (7,822 cycles)
+- [x] Software pipelining - overlap Hash(N) with Gather(N+1) (5,454 cycles)
+- [x] vselect → arithmetic - replace FLOW ops with VALU (7,182 cycles)
+- [x] Bitwise AND - replace `(val%2==0)?1:2` with `1+(val&1)` (5,262 cycles)
+- [x] Store||XOR overlap - pack store with next XOR (5,118 cycles)
+- [x] Triple engine overlap - Store||VALU||ALU in same cycle (4,991 cycles)
+
 ### High Priority (Implement Next)
-- [ ] 3-vector VALU parallelism - use all 6 VALU slots during hash
-- [ ] Software pipelining - overlap load/compute/store
-- [ ] Store/Load overlap - 3-stage pipeline
+- [ ] Deeper pipelining - overlap Store(N-1) with vload(N+1)
+  - Attempted: register conflict (v_idx_n holds N+1 data while loading N+2)
+  - Need triple-buffering or different register allocation strategy
+- [ ] Reduce index update overhead (currently 5 cycles)
+  - Pre-compute more addresses during hash phase
+  - Overlap address computation with final stores
 
 ### Medium Priority
-- [ ] Hash stage unrolling
-- [ ] Fused multiply-add in hash
-- [ ] Address pre-computation during hash
+- [ ] Hash stage unrolling - pack more ops per cycle within hash
+- [ ] Fused multiply-add in hash (if architecture supports)
+- [ ] 2-vector remainder handling - avoid scalar fallback for non-divisible batch sizes
 
 ### Low Priority / Speculative
-- [ ] Runtime check for sequential indices (use vload)
+- [ ] Runtime check for sequential indices (use vload instead of gather)
 - [ ] Loop interchange (process multiple rounds together)
 - [ ] Memory layout restructuring
 
 ### Evaluated & Rejected
 - Shuffle/sort for gather coalescing (no native support, indices diverge)
 - Reduce hash stages (changes algorithm semantics)
+- Store||vload deep pipeline (register conflict without triple-buffering)
 
 ---
 
@@ -96,4 +84,17 @@
 - Bitwise AND: → 5,262 cycles (28.1x) - replace (val%2==0)?1:2 with 1+(val&1)
 - Store||XOR: → 5,118 cycles (28.9x) - overlap store with XOR
 - Triple engine overlap: → 4,991 cycles (29.6x) - Store||XOR||LoadAddrs
-  - Bottleneck: Hash||Gather overlap (12 cycles), index update (5 cycles)
+
+**Current bottleneck analysis (4,991 cycles):**
+- Hash||Gather overlap: 12 cycles (24 gathers at 2/cycle, fully overlapped with 12-cycle hash)
+- Index update: ~5 cycles (address calc + vload for next iteration)
+- Store + wrap check: ~3 cycles
+- Per super-iteration: ~20 cycles × 171 iterations = 3,420 cycles (theoretical)
+- Actual: 4,991 cycles → ~9 cycles overhead somewhere (prologue/epilogue, remainder handling)
+
+**Failed attempt:** Store(N-1)||vload(N+1) deep pipeline
+- Register conflict: v_idx_n holds N+1's data, can't load N+2 into same register
+- Would need triple-buffering (v_idx_a, v_idx_b, v_idx_c) with rotation
+- Reverted - complexity vs benefit unclear
+
+**Target:** 1,487 cycles requires ~3.4x more improvement
