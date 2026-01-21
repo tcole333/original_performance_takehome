@@ -150,19 +150,68 @@ class KernelBuilder:
 
         return bundles
 
+    def build_hash_simd_3wide(self, v_vals, v_tmp1s, v_tmp2s, round, batch_bases):
+        """
+        Build hash stages for 3 vectors simultaneously, using all 6 VALU slots.
+        v_vals, v_tmp1s, v_tmp2s are lists of 3 vector register addresses.
+        batch_bases is a list of 3 batch base indices.
+        """
+        bundles = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_const1 = self.alloc_vector_const(val1)
+            v_const3 = self.alloc_vector_const(val3)
+
+            # VLIW Pack: All 6 tmp computations (2 ops × 3 vectors) - uses all 6 VALU slots
+            bundles.append({
+                "valu": [
+                    (op1, v_tmp1s[0], v_vals[0], v_const1),
+                    (op3, v_tmp2s[0], v_vals[0], v_const3),
+                    (op1, v_tmp1s[1], v_vals[1], v_const1),
+                    (op3, v_tmp2s[1], v_vals[1], v_const3),
+                    (op1, v_tmp1s[2], v_vals[2], v_const1),
+                    (op3, v_tmp2s[2], v_vals[2], v_const3),
+                ]
+            })
+            # Final combine for all 3 vectors (3 VALU slots)
+            bundles.append({
+                "valu": [
+                    (op2, v_vals[0], v_tmp1s[0], v_tmp2s[0]),
+                    (op2, v_vals[1], v_tmp1s[1], v_tmp2s[1]),
+                    (op2, v_vals[2], v_tmp1s[2], v_tmp2s[2]),
+                ]
+            })
+            # Debug compares for all 3 vectors
+            bundles.append({
+                "debug": [
+                    ("vcompare", v_vals[0], tuple((round, batch_bases[0] + j, "hash_stage", hi) for j in range(VLEN))),
+                    ("vcompare", v_vals[1], tuple((round, batch_bases[1] + j, "hash_stage", hi) for j in range(VLEN))),
+                    ("vcompare", v_vals[2], tuple((round, batch_bases[2] + j, "hash_stage", hi) for j in range(VLEN))),
+                ]
+            })
+
+        return bundles
+
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        SIMD implementation processing VLEN items per iteration.
-        Uses vload/vstore for contiguous data, scalar loads for gather.
+        3-vector SIMD implementation processing 24 items per super-iteration.
+        Uses all 6 VALU slots during hash for maximum throughput.
+        Falls back to single-vector for remainder items.
         """
         # Scalar temps
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
         tmp_addr = self.alloc_scratch("tmp_addr")
-        tmp_addr2 = self.alloc_scratch("tmp_addr2")  # For parallel address computation
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")
+
+        # Additional scalar temps for 3-vector parallel address computation
+        tmp_addr3 = self.alloc_scratch("tmp_addr3")
+        tmp_addr4 = self.alloc_scratch("tmp_addr4")
+        tmp_addr5 = self.alloc_scratch("tmp_addr5")
+        tmp_addr6 = self.alloc_scratch("tmp_addr6")
 
         # Scratch space addresses for memory layout
         init_vars = [
@@ -185,14 +234,14 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Vector registers (VLEN=8 slots each)
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)  # For gather addresses
+        # 3 sets of vector registers for 3-vector parallel processing
+        v_idx = [self.alloc_scratch(f"v_idx_{i}", VLEN) for i in range(3)]
+        v_val = [self.alloc_scratch(f"v_val_{i}", VLEN) for i in range(3)]
+        v_node_val = [self.alloc_scratch(f"v_node_val_{i}", VLEN) for i in range(3)]
+        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{i}", VLEN) for i in range(3)]
+        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(3)]
+        v_tmp3 = [self.alloc_scratch(f"v_tmp3_{i}", VLEN) for i in range(3)]
+        v_addr = [self.alloc_scratch(f"v_addr_{i}", VLEN) for i in range(3)]
 
         # Vector constants (broadcast from scalars)
         v_zero = self.alloc_vector_const(0)
@@ -208,91 +257,277 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting SIMD loop"))
+        self.add("debug", ("comment", "Starting 3-vector SIMD loop"))
 
         body = []
 
+        # Super-iteration stride: 3 vectors × VLEN = 24 items
+        super_stride = VLEN * 3
+
         for round in range(rounds):
-            # Process batch in chunks of VLEN=8
-            for batch_base in range(0, batch_size, VLEN):
+            # Process batch in super-iterations of 24 items
+            batch_base = 0
+            while batch_base + super_stride <= batch_size:
+                # Process 3 vectors in parallel
+                batch_bases = [batch_base, batch_base + VLEN, batch_base + 2 * VLEN]
+                i_consts = [self.scratch_const(bb) for bb in batch_bases]
+
+                # === Load addresses for all 3 vectors (6 ALU ops, 1 cycle) ===
+                body.append({
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_consts[0]),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_consts[0]),
+                        ("+", tmp_addr3, self.scratch["inp_indices_p"], i_consts[1]),
+                        ("+", tmp_addr4, self.scratch["inp_values_p"], i_consts[1]),
+                        ("+", tmp_addr5, self.scratch["inp_indices_p"], i_consts[2]),
+                        ("+", tmp_addr6, self.scratch["inp_values_p"], i_consts[2]),
+                    ]
+                })
+
+                # === vload for all 3 vectors (6 vloads, 3 cycles at 2/cycle) ===
+                body.append({
+                    "load": [
+                        ("vload", v_idx[0], tmp_addr),
+                        ("vload", v_val[0], tmp_addr2),
+                    ]
+                })
+                body.append({
+                    "load": [
+                        ("vload", v_idx[1], tmp_addr3),
+                        ("vload", v_val[1], tmp_addr4),
+                    ]
+                })
+                body.append({
+                    "load": [
+                        ("vload", v_idx[2], tmp_addr5),
+                        ("vload", v_val[2], tmp_addr6),
+                    ]
+                })
+
+                # Debug compares
+                for vi in range(3):
+                    body.append({
+                        "debug": [
+                            ("vcompare", v_idx[vi], tuple((round, batch_bases[vi] + j, "idx") for j in range(VLEN))),
+                            ("vcompare", v_val[vi], tuple((round, batch_bases[vi] + j, "val") for j in range(VLEN))),
+                        ]
+                    })
+
+                # === Gather addresses for all 3 vectors (3 VALU ops, 1 cycle) ===
+                body.append({
+                    "valu": [
+                        ("+", v_addr[0], v_forest_p, v_idx[0]),
+                        ("+", v_addr[1], v_forest_p, v_idx[1]),
+                        ("+", v_addr[2], v_forest_p, v_idx[2]),
+                    ]
+                })
+
+                # === Gather: 24 load_offsets at 2/cycle = 12 cycles ===
+                for vi in range(3):
+                    for offset in range(0, VLEN, 2):
+                        body.append({
+                            "load": [
+                                ("load_offset", v_node_val[vi], v_addr[vi], offset),
+                                ("load_offset", v_node_val[vi], v_addr[vi], offset + 1),
+                            ]
+                        })
+
+                # Debug compares for node_val
+                for vi in range(3):
+                    body.append({
+                        "debug": [
+                            ("vcompare", v_node_val[vi], tuple((round, batch_bases[vi] + j, "node_val") for j in range(VLEN)))
+                        ]
+                    })
+
+                # === XOR: val = val ^ node_val for all 3 vectors (3 VALU ops, 1 cycle) ===
+                body.append({
+                    "valu": [
+                        ("^", v_val[0], v_val[0], v_node_val[0]),
+                        ("^", v_val[1], v_val[1], v_node_val[1]),
+                        ("^", v_val[2], v_val[2], v_node_val[2]),
+                    ]
+                })
+
+                # === Hash using 3-wide SIMD (12 cycles, all 6 VALU slots) ===
+                body.extend(self.build_hash_simd_3wide(v_val, v_tmp1, v_tmp2, round, batch_bases))
+
+                # Debug compares for hashed_val
+                for vi in range(3):
+                    body.append({
+                        "debug": [
+                            ("vcompare", v_val[vi], tuple((round, batch_bases[vi] + j, "hashed_val") for j in range(VLEN)))
+                        ]
+                    })
+
+                # === idx = 2*idx + (1 if val % 2 == 0 else 2) ===
+                # % and * for all 3 vectors (6 VALU ops, 1 cycle)
+                body.append({
+                    "valu": [
+                        ("%", v_tmp1[0], v_val[0], v_two),
+                        ("*", v_idx[0], v_idx[0], v_two),
+                        ("%", v_tmp1[1], v_val[1], v_two),
+                        ("*", v_idx[1], v_idx[1], v_two),
+                        ("%", v_tmp1[2], v_val[2], v_two),
+                        ("*", v_idx[2], v_idx[2], v_two),
+                    ]
+                })
+
+                # == for all 3 vectors (3 VALU ops, 1 cycle)
+                body.append({
+                    "valu": [
+                        ("==", v_tmp1[0], v_tmp1[0], v_zero),
+                        ("==", v_tmp1[1], v_tmp1[1], v_zero),
+                        ("==", v_tmp1[2], v_tmp1[2], v_zero),
+                    ]
+                })
+
+                # vselect for all 3 vectors (3 flow ops at 1/cycle = 3 cycles)
+                for vi in range(3):
+                    body.append({"flow": [("vselect", v_tmp3[vi], v_tmp1[vi], v_one, v_two)]})
+
+                # + for all 3 vectors (3 VALU ops, 1 cycle)
+                body.append({
+                    "valu": [
+                        ("+", v_idx[0], v_idx[0], v_tmp3[0]),
+                        ("+", v_idx[1], v_idx[1], v_tmp3[1]),
+                        ("+", v_idx[2], v_idx[2], v_tmp3[2]),
+                    ]
+                })
+
+                # Debug compares for next_idx
+                for vi in range(3):
+                    body.append({
+                        "debug": [
+                            ("vcompare", v_idx[vi], tuple((round, batch_bases[vi] + j, "next_idx") for j in range(VLEN)))
+                        ]
+                    })
+
+                # === Wrap: idx = 0 if idx >= n_nodes else idx ===
+                # < for all 3 vectors (3 VALU ops, 1 cycle)
+                body.append({
+                    "valu": [
+                        ("<", v_tmp1[0], v_idx[0], v_n_nodes),
+                        ("<", v_tmp1[1], v_idx[1], v_n_nodes),
+                        ("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                    ]
+                })
+
+                # vselect for all 3 vectors (3 cycles)
+                # Pack first vselect with address computation
+                body.append({
+                    "flow": [("vselect", v_idx[0], v_tmp1[0], v_idx[0], v_zero)],
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_consts[0]),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_consts[0]),
+                        ("+", tmp_addr3, self.scratch["inp_indices_p"], i_consts[1]),
+                        ("+", tmp_addr4, self.scratch["inp_values_p"], i_consts[1]),
+                    ]
+                })
+                body.append({
+                    "flow": [("vselect", v_idx[1], v_tmp1[1], v_idx[1], v_zero)],
+                    "alu": [
+                        ("+", tmp_addr5, self.scratch["inp_indices_p"], i_consts[2]),
+                        ("+", tmp_addr6, self.scratch["inp_values_p"], i_consts[2]),
+                    ]
+                })
+                body.append({"flow": [("vselect", v_idx[2], v_tmp1[2], v_idx[2], v_zero)]})
+
+                # Debug compares for wrapped_idx
+                for vi in range(3):
+                    body.append({
+                        "debug": [
+                            ("vcompare", v_idx[vi], tuple((round, batch_bases[vi] + j, "wrapped_idx") for j in range(VLEN)))
+                        ]
+                    })
+
+                # === vstore for all 3 vectors (6 vstores, 3 cycles at 2/cycle) ===
+                body.append({
+                    "store": [
+                        ("vstore", tmp_addr, v_idx[0]),
+                        ("vstore", tmp_addr2, v_val[0]),
+                    ]
+                })
+                body.append({
+                    "store": [
+                        ("vstore", tmp_addr3, v_idx[1]),
+                        ("vstore", tmp_addr4, v_val[1]),
+                    ]
+                })
+                body.append({
+                    "store": [
+                        ("vstore", tmp_addr5, v_idx[2]),
+                        ("vstore", tmp_addr6, v_val[2]),
+                    ]
+                })
+
+                batch_base += super_stride
+
+            # Handle remaining items with single-vector iterations
+            while batch_base < batch_size:
                 i_const = self.scratch_const(batch_base)
 
-                # === VLIW Pack: Load idx and val in parallel ===
-                # Compute both addresses (1 cycle)
+                # Use first set of vector registers for remainder
                 body.append({
                     "alu": [
                         ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
                         ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
                     ]
                 })
-                # Both vloads in same cycle (SLOT_LIMITS["load"] = 2)
                 body.append({
                     "load": [
-                        ("vload", v_idx, tmp_addr),
-                        ("vload", v_val, tmp_addr2),
+                        ("vload", v_idx[0], tmp_addr),
+                        ("vload", v_val[0], tmp_addr2),
                     ]
                 })
                 body.append({
                     "debug": [
-                        ("vcompare", v_idx, tuple((round, batch_base + j, "idx") for j in range(VLEN))),
-                        ("vcompare", v_val, tuple((round, batch_base + j, "val") for j in range(VLEN))),
+                        ("vcompare", v_idx[0], tuple((round, batch_base + j, "idx") for j in range(VLEN))),
+                        ("vcompare", v_val[0], tuple((round, batch_base + j, "val") for j in range(VLEN))),
                     ]
                 })
 
-                # === Gather: compute addresses for forest lookup ===
-                # v_addr[j] = forest_values_p + v_idx[j]
-                # v_forest_p already broadcast before loop
-                body.append({"valu": [("+", v_addr, v_forest_p, v_idx)]})
+                body.append({"valu": [("+", v_addr[0], v_forest_p, v_idx[0])]})
 
-                # === 8 scalar loads for gather (2 per cycle = 4 cycles) ===
                 for offset in range(0, VLEN, 2):
                     body.append({
                         "load": [
-                            ("load_offset", v_node_val, v_addr, offset),
-                            ("load_offset", v_node_val, v_addr, offset + 1),
+                            ("load_offset", v_node_val[0], v_addr[0], offset),
+                            ("load_offset", v_node_val[0], v_addr[0], offset + 1),
                         ]
                     })
                 body.append({
                     "debug": [
-                        ("vcompare", v_node_val, tuple((round, batch_base + j, "node_val") for j in range(VLEN)))
+                        ("vcompare", v_node_val[0], tuple((round, batch_base + j, "node_val") for j in range(VLEN)))
                     ]
                 })
 
-                # === val = myhash(val ^ node_val) using valu ===
-                body.append({"valu": [("^", v_val, v_val, v_node_val)]})
-                body.extend(self.build_hash_simd(v_val, v_tmp1, v_tmp2, round, batch_base))
+                body.append({"valu": [("^", v_val[0], v_val[0], v_node_val[0])]})
+                body.extend(self.build_hash_simd(v_val[0], v_tmp1[0], v_tmp2[0], round, batch_base))
                 body.append({
                     "debug": [
-                        ("vcompare", v_val, tuple((round, batch_base + j, "hashed_val") for j in range(VLEN)))
+                        ("vcompare", v_val[0], tuple((round, batch_base + j, "hashed_val") for j in range(VLEN)))
                     ]
                 })
 
-                # === idx = 2*idx + (1 if val % 2 == 0 else 2) ===
-                # VLIW Pack: % and * are independent (1 cycle)
                 body.append({
                     "valu": [
-                        ("%", v_tmp1, v_val, v_two),
-                        ("*", v_idx, v_idx, v_two),
+                        ("%", v_tmp1[0], v_val[0], v_two),
+                        ("*", v_idx[0], v_idx[0], v_two),
                     ]
                 })
-                # v_tmp1 = (v_tmp1 == 0)
-                body.append({"valu": [("==", v_tmp1, v_tmp1, v_zero)]})
-                # v_tmp3 = select(v_tmp1, 1, 2)
-                body.append({"flow": [("vselect", v_tmp3, v_tmp1, v_one, v_two)]})
-                # v_idx = v_idx + v_tmp3
-                body.append({"valu": [("+", v_idx, v_idx, v_tmp3)]})
+                body.append({"valu": [("==", v_tmp1[0], v_tmp1[0], v_zero)]})
+                body.append({"flow": [("vselect", v_tmp3[0], v_tmp1[0], v_one, v_two)]})
+                body.append({"valu": [("+", v_idx[0], v_idx[0], v_tmp3[0])]})
                 body.append({
                     "debug": [
-                        ("vcompare", v_idx, tuple((round, batch_base + j, "next_idx") for j in range(VLEN)))
+                        ("vcompare", v_idx[0], tuple((round, batch_base + j, "next_idx") for j in range(VLEN)))
                     ]
                 })
 
-                # === idx = 0 if idx >= n_nodes else idx ===
-                body.append({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-                # VLIW Pack: vselect (flow) with store address computation (alu)
-                # These use different engines and addresses don't depend on v_idx
+                body.append({"valu": [("<", v_tmp1[0], v_idx[0], v_n_nodes)]})
                 body.append({
-                    "flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)],
+                    "flow": [("vselect", v_idx[0], v_tmp1[0], v_idx[0], v_zero)],
                     "alu": [
                         ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
                         ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
@@ -300,16 +535,17 @@ class KernelBuilder:
                 })
                 body.append({
                     "debug": [
-                        ("vcompare", v_idx, tuple((round, batch_base + j, "wrapped_idx") for j in range(VLEN)))
+                        ("vcompare", v_idx[0], tuple((round, batch_base + j, "wrapped_idx") for j in range(VLEN)))
                     ]
                 })
-                # Both vstores in same cycle (SLOT_LIMITS["store"] = 2)
                 body.append({
                     "store": [
-                        ("vstore", tmp_addr, v_idx),
-                        ("vstore", tmp_addr2, v_val),
+                        ("vstore", tmp_addr, v_idx[0]),
+                        ("vstore", tmp_addr2, v_val[0]),
                     ]
                 })
+
+                batch_base += VLEN
 
         self.instrs.extend(body)
         self.instrs.append({"flow": [("pause",)]})

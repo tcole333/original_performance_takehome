@@ -55,3 +55,36 @@
 
 ### Ideas Evaluated and Rejected
 - **Shuffle/repack for contiguous gathers** - No native sort primitives, indices diverge after each hash, overhead would exceed benefit
+
+---
+
+## Optimization Backlog (Track Across Sessions)
+
+### High Priority (Implement Next)
+- [ ] 3-vector VALU parallelism - use all 6 VALU slots during hash
+- [ ] Software pipelining - overlap load/compute/store
+- [ ] Store/Load overlap - 3-stage pipeline
+
+### Medium Priority
+- [ ] Hash stage unrolling
+- [ ] Fused multiply-add in hash
+- [ ] Address pre-computation during hash
+
+### Low Priority / Speculative
+- [ ] Runtime check for sequential indices (use vload)
+- [ ] Loop interchange (process multiple rounds together)
+- [ ] Memory layout restructuring
+
+### Evaluated & Rejected
+- Shuffle/sort for gather coalescing (no native support, indices diverge)
+- Reduce hash stages (changes algorithm semantics)
+
+---
+
+## Experiments Log
+
+### Session 1 (Initial optimizations)
+- VLIW packing: 147,734 → 102,678 cycles
+- SIMD vectorization: → 17,485 cycles
+- Better VLIW packing: → 14,414 cycles
+- Cross-engine packing: → 13,902 cycles (current best)
