@@ -26,18 +26,32 @@
 - Pack % and * operations together (2 → 1 cycle)
 - Pack vstores into same cycle (4 → 2 cycles)
 
+### Optimization 4: Cross-Engine VLIW Packing
+- **Cycles:** 13,902 (10.63x speedup over baseline, 1.04x over opt 3)
+- Pack flow (vselect for wrap) with alu (store address computation)
+- These use different engines and have no data dependencies
+- Saves 1 cycle per iteration × 512 iterations = 512 cycles
+
 ---
 
 ## Ideas to Try Next
 
 ### High Priority
-1. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
-2. **Software Pipelining** - Overlap iterations (start next vload while computing current)
+1. **Software Pipelining** - Prefetch next iteration's idx/val during hash phase
+   - Hash phase is ~12 cycles with LOAD unit idle
+   - Could load next iteration's data during this time
+   - Requires double-buffering registers (v_idx/v_idx_next)
+   - Attempted but incomplete - need to actually USE prefetched values
+
+2. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
 
 ### Medium Priority
 3. **Fused Operations** - Use multiply_add where applicable in hash
-4. **More ALU/VALU Packing** - Look for other independent operations
+4. **Pack more across engines** - Look for other flow/alu/valu overlaps
 
 ### Lower Priority / Speculative
-5. **Better Gather Pattern** - Sort batch by tree index (complex, likely not worth it)
-6. **Precompute batch_base constants** - Minor optimization
+5. **Better Gather Pattern** - Sort batch by tree index (complex, indices diverge each round)
+6. **Reduce hash stages** - Algorithmic change, may not preserve semantics
+
+### Ideas Evaluated and Rejected
+- **Shuffle/repack for contiguous gathers** - No native sort primitives, indices diverge after each hash, overhead would exceed benefit

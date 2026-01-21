@@ -289,19 +289,18 @@ class KernelBuilder:
 
                 # === idx = 0 if idx >= n_nodes else idx ===
                 body.append({"valu": [("<", v_tmp1, v_idx, v_n_nodes)]})
-                body.append({"flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)]})
+                # VLIW Pack: vselect (flow) with store address computation (alu)
+                # These use different engines and addresses don't depend on v_idx
                 body.append({
-                    "debug": [
-                        ("vcompare", v_idx, tuple((round, batch_base + j, "wrapped_idx") for j in range(VLEN)))
-                    ]
-                })
-
-                # === VLIW Pack: Store results with vstore ===
-                # Compute both addresses (1 cycle)
-                body.append({
+                    "flow": [("vselect", v_idx, v_tmp1, v_idx, v_zero)],
                     "alu": [
                         ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
                         ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
+                    ]
+                })
+                body.append({
+                    "debug": [
+                        ("vcompare", v_idx, tuple((round, batch_base + j, "wrapped_idx") for j in range(VLEN)))
                     ]
                 })
                 # Both vstores in same cycle (SLOT_LIMITS["store"] = 2)
