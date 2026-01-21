@@ -11,22 +11,29 @@
 - Pack hash stage intermediate computations (2 ALU ops -> 1 cycle)
 - Added `tmp_addr2` scratch register to avoid write conflicts
 
+### Optimization 2: SIMD Vectorization
+- **Cycles:** 17,485 (8.45x speedup over baseline, 5.87x over opt 1)
+- Process VLEN=8 batch items per iteration (32 iterations instead of 256)
+- vload/vstore for contiguous idx[] and val[] arrays (1 cycle for 8 values)
+- 8 scalar loads for forest gather (4 cycles, 2 loads/cycle)
+- valu for all hash computations (same cycles, 8x throughput)
+- vselect for conditional operations
+
 ---
 
 ## Ideas to Try Next
 
-### High Priority (Big Gains Expected)
-1. **SIMD Vectorization** - Process VLEN=8 batch items per iteration instead of 1
-   - Use vload/vstore for contiguous batch data
-   - Use valu for parallel hash computations
-   - Challenge: forest lookups are non-contiguous (gather pattern)
+### High Priority
+1. **More VLIW Packing in SIMD** - Current SIMD code has sequential dependencies we can break
+   - Pack vload for idx and val into same cycle (they're independent)
+   - Pack more valu operations together
 
-2. **Loop Unrolling** - Reduce loop overhead, expose more ILP
+2. **Loop Unrolling** - Process 2+ chunks of 8 per inner loop iteration
 
 ### Medium Priority
-3. **Software Pipelining** - Overlap iterations (start next load while computing current)
-4. **Batch Reordering** - Group items by tree index for better memory access patterns
+3. **Software Pipelining** - Overlap iterations (start next vload while computing current)
+4. **Reduce Redundant Broadcasts** - v_forest_p broadcast repeated every iteration
 
 ### Lower Priority / Speculative
-5. **Precompute Constants** - Move repeated scratch_const lookups out of loop
-6. **Memory Layout Optimization** - Restructure data for better cache behavior
+5. **Better Gather Pattern** - Sort batch by tree index to improve locality
+6. **Fused Operations** - Use multiply_add where applicable
