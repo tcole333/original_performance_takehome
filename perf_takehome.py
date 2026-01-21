@@ -495,17 +495,17 @@ class KernelBuilder:
                             ("vcompare", v_idx[vi], tuple((round, curr_batch_bases[vi] + j, "wrapped_idx") for j in range(VLEN)))
                         ]})
 
-                    # Store CURRENT
-                    body.append({"store": [("vstore", tmp_addr, v_idx[0]), ("vstore", tmp_addr2, v_val[0])]})
+                    # Store CURRENT || XOR for NEXT (first cycle overlapped)
+                    body.append({
+                        "store": [("vstore", tmp_addr, v_idx[0]), ("vstore", tmp_addr2, v_val[0])],
+                        "valu": [
+                            ("^", v_val_n[0], v_val_n[0], v_node_val_n[0]),
+                            ("^", v_val_n[1], v_val_n[1], v_node_val_n[1]),
+                            ("^", v_val_n[2], v_val_n[2], v_node_val_n[2]),
+                        ]
+                    })
                     body.append({"store": [("vstore", tmp_addr3, v_idx[1]), ("vstore", tmp_addr4, v_val[1])]})
                     body.append({"store": [("vstore", tmp_addr5, v_idx[2]), ("vstore", tmp_addr6, v_val[2])]})
-
-                    # XOR for NEXT (gathered values are ready)
-                    body.append({"valu": [
-                        ("^", v_val_n[0], v_val_n[0], v_node_val_n[0]),
-                        ("^", v_val_n[1], v_val_n[1], v_node_val_n[1]),
-                        ("^", v_val_n[2], v_val_n[2], v_node_val_n[2]),
-                    ]})
 
                     # Swap: NEXT becomes CURRENT for next iteration
                     v_idx, v_idx_n = v_idx_n, v_idx
