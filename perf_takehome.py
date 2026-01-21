@@ -382,9 +382,15 @@ class KernelBuilder:
                     ]
                 })
 
-                # vselect for all 3 vectors (3 flow ops at 1/cycle = 3 cycles)
-                for vi in range(3):
-                    body.append({"flow": [("vselect", v_tmp3[vi], v_tmp1[vi], v_one, v_two)]})
+                # Replace vselect with arithmetic: select(cond, 1, 2) = 2 - cond
+                # tmp3 = 2 - tmp1 for all 3 vectors (3 VALU ops, 1 cycle)
+                body.append({
+                    "valu": [
+                        ("-", v_tmp3[0], v_two, v_tmp1[0]),
+                        ("-", v_tmp3[1], v_two, v_tmp1[1]),
+                        ("-", v_tmp3[2], v_two, v_tmp1[2]),
+                    ]
+                })
 
                 # + for all 3 vectors (3 VALU ops, 1 cycle)
                 body.append({
@@ -413,25 +419,23 @@ class KernelBuilder:
                     ]
                 })
 
-                # vselect for all 3 vectors (3 cycles)
-                # Pack first vselect with address computation
+                # Replace vselect with arithmetic: select(cond, idx, 0) = idx * cond
+                # Pack with address computation (6 VALU + 6 ALU in 1 cycle)
                 body.append({
-                    "flow": [("vselect", v_idx[0], v_tmp1[0], v_idx[0], v_zero)],
+                    "valu": [
+                        ("*", v_idx[0], v_idx[0], v_tmp1[0]),
+                        ("*", v_idx[1], v_idx[1], v_tmp1[1]),
+                        ("*", v_idx[2], v_idx[2], v_tmp1[2]),
+                    ],
                     "alu": [
                         ("+", tmp_addr, self.scratch["inp_indices_p"], i_consts[0]),
                         ("+", tmp_addr2, self.scratch["inp_values_p"], i_consts[0]),
                         ("+", tmp_addr3, self.scratch["inp_indices_p"], i_consts[1]),
                         ("+", tmp_addr4, self.scratch["inp_values_p"], i_consts[1]),
-                    ]
-                })
-                body.append({
-                    "flow": [("vselect", v_idx[1], v_tmp1[1], v_idx[1], v_zero)],
-                    "alu": [
                         ("+", tmp_addr5, self.scratch["inp_indices_p"], i_consts[2]),
                         ("+", tmp_addr6, self.scratch["inp_values_p"], i_consts[2]),
                     ]
                 })
-                body.append({"flow": [("vselect", v_idx[2], v_tmp1[2], v_idx[2], v_zero)]})
 
                 # Debug compares for wrapped_idx
                 for vi in range(3):
@@ -517,7 +521,8 @@ class KernelBuilder:
                     ]
                 })
                 body.append({"valu": [("==", v_tmp1[0], v_tmp1[0], v_zero)]})
-                body.append({"flow": [("vselect", v_tmp3[0], v_tmp1[0], v_one, v_two)]})
+                # Replace vselect with arithmetic: select(cond, 1, 2) = 2 - cond
+                body.append({"valu": [("-", v_tmp3[0], v_two, v_tmp1[0])]})
                 body.append({"valu": [("+", v_idx[0], v_idx[0], v_tmp3[0])]})
                 body.append({
                     "debug": [
@@ -526,8 +531,9 @@ class KernelBuilder:
                 })
 
                 body.append({"valu": [("<", v_tmp1[0], v_idx[0], v_n_nodes)]})
+                # Replace vselect with arithmetic: select(cond, idx, 0) = idx * cond
                 body.append({
-                    "flow": [("vselect", v_idx[0], v_tmp1[0], v_idx[0], v_zero)],
+                    "valu": [("*", v_idx[0], v_idx[0], v_tmp1[0])],
                     "alu": [
                         ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
                         ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),

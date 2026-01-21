@@ -87,4 +87,10 @@
 - VLIW packing: 147,734 → 102,678 cycles
 - SIMD vectorization: → 17,485 cycles
 - Better VLIW packing: → 14,414 cycles
-- Cross-engine packing: → 13,902 cycles (current best)
+- Cross-engine packing: → 13,902 cycles
+
+### Session 2 (Multi-vector pipelining)
+- 3-vector VALU parallelism: → 7,822 cycles (18.9x over baseline)
+  - Uses all 6 VALU slots during hash stages
+  - Processes 24 items per super-iteration
+  - Bottleneck now is gather (12 cycles for 24 load_offsets)
