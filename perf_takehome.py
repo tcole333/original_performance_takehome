@@ -52,6 +52,13 @@ class KernelBuilder:
             instrs.append({engine: [slot]})
         return instrs
 
+    def build_vliw(self, bundles: list[dict[str, list[tuple]]]):
+        """
+        Build instruction bundles for VLIW execution.
+        Each bundle is a dict mapping engine names to lists of slots.
+        """
+        return bundles
+
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
 
@@ -81,6 +88,29 @@ class KernelBuilder:
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
+
+    def build_hash_vliw(self, val_hash_addr, tmp1, tmp2, round, i):
+        """
+        Build hash stages with VLIW packing.
+        Each hash stage: tmp1 = op1(val, const1), tmp2 = op3(val, const3), val = op2(tmp1, tmp2)
+        The first two ops are independent and can be packed.
+        """
+        bundles = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # VLIW Pack: Both tmp computations are independent (1 cycle)
+            bundles.append({
+                "alu": [
+                    (op1, tmp1, val_hash_addr, self.scratch_const(val1)),
+                    (op3, tmp2, val_hash_addr, self.scratch_const(val3)),
+                ]
+            })
+            # Final combine depends on both (1 cycle)
+            bundles.append({"alu": [(op2, val_hash_addr, tmp1, tmp2)]})
+            # Debug compare must be separate
+            bundles.append({"debug": [("compare", val_hash_addr, (round, i, "hash_stage", hi))]})
+
+        return bundles
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
@@ -127,46 +157,78 @@ class KernelBuilder:
         tmp_val = self.alloc_scratch("tmp_val")
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")  # Second address for parallel loads
 
         for round in range(rounds):
             for i in range(batch_size):
                 i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+                # VLIW Pack: Compute both addresses in parallel (1 cycle)
+                body.append({
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
+                    ]
+                })
+                # VLIW Pack: Load both values in parallel (1 cycle)
+                body.append({
+                    "load": [
+                        ("load", tmp_idx, tmp_addr),
+                        ("load", tmp_val, tmp_addr2),
+                    ],
+                })
+                # Debug compares must be separate (values not in scratch until after cycle)
+                body.append({
+                    "debug": [
+                        ("compare", tmp_idx, (round, i, "idx")),
+                        ("compare", tmp_val, (round, i, "val")),
+                    ]
+                })
+
+                # node_val = mem[forest_values_p + idx] (2 cycles - dependency)
+                body.append({"alu": [("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)]})
+                body.append({"load": [("load", tmp_node_val, tmp_addr)]})
+                body.append({"debug": [("compare", tmp_node_val, (round, i, "node_val"))]})
+
+                # val = myhash(val ^ node_val)
+                body.append({"alu": [("^", tmp_val, tmp_val, tmp_node_val)]})
+                body.extend(self.build_hash_vliw(tmp_val, tmp1, tmp2, round, i))
+                body.append({"debug": [("compare", tmp_val, (round, i, "hashed_val"))]})
+
+                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                # VLIW Pack: Compute % and * in parallel (1 cycle)
+                body.append({
+                    "alu": [
+                        ("%", tmp1, tmp_val, two_const),
+                        ("*", tmp_idx, tmp_idx, two_const),
+                    ]
+                })
+                body.append({"alu": [("==", tmp1, tmp1, zero_const)]})
+                body.append({"flow": [("select", tmp3, tmp1, one_const, two_const)]})
+                body.append({"alu": [("+", tmp_idx, tmp_idx, tmp3)]})
+                body.append({"debug": [("compare", tmp_idx, (round, i, "next_idx"))]})
+
+                # idx = 0 if idx >= n_nodes else idx
+                body.append({"alu": [("<", tmp1, tmp_idx, self.scratch["n_nodes"])]})
+                body.append({"flow": [("select", tmp_idx, tmp1, tmp_idx, zero_const)]})
+                body.append({"debug": [("compare", tmp_idx, (round, i, "wrapped_idx"))]})
+
+                # VLIW Pack: Compute both store addresses in parallel (1 cycle)
+                body.append({
+                    "alu": [
+                        ("+", tmp_addr, self.scratch["inp_indices_p"], i_const),
+                        ("+", tmp_addr2, self.scratch["inp_values_p"], i_const),
+                    ]
+                })
+                # VLIW Pack: Store both values in parallel (1 cycle)
+                body.append({
+                    "store": [
+                        ("store", tmp_addr, tmp_idx),
+                        ("store", tmp_addr2, tmp_val),
+                    ]
+                })
+
+        self.instrs.extend(body)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
