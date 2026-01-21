@@ -446,20 +446,17 @@ class KernelBuilder:
                         ]})
 
                     # Index update for CURRENT
+                    # Optimized: tmp1 = val & 1 (0 if even, 1 if odd)
+                    # tmp3 = 1 + tmp1 (1 if even, 2 if odd)
                     body.append({"valu": [
-                        ("%", v_tmp1[0], v_val[0], v_two), ("*", v_idx[0], v_idx[0], v_two),
-                        ("%", v_tmp1[1], v_val[1], v_two), ("*", v_idx[1], v_idx[1], v_two),
-                        ("%", v_tmp1[2], v_val[2], v_two), ("*", v_idx[2], v_idx[2], v_two),
+                        ("&", v_tmp1[0], v_val[0], v_one), ("*", v_idx[0], v_idx[0], v_two),
+                        ("&", v_tmp1[1], v_val[1], v_one), ("*", v_idx[1], v_idx[1], v_two),
+                        ("&", v_tmp1[2], v_val[2], v_one), ("*", v_idx[2], v_idx[2], v_two),
                     ]})
                     body.append({"valu": [
-                        ("==", v_tmp1[0], v_tmp1[0], v_zero),
-                        ("==", v_tmp1[1], v_tmp1[1], v_zero),
-                        ("==", v_tmp1[2], v_tmp1[2], v_zero),
-                    ]})
-                    body.append({"valu": [
-                        ("-", v_tmp3[0], v_two, v_tmp1[0]),
-                        ("-", v_tmp3[1], v_two, v_tmp1[1]),
-                        ("-", v_tmp3[2], v_two, v_tmp1[2]),
+                        ("+", v_tmp3[0], v_one, v_tmp1[0]),
+                        ("+", v_tmp3[1], v_one, v_tmp1[1]),
+                        ("+", v_tmp3[2], v_one, v_tmp1[2]),
                     ]})
                     body.append({"valu": [
                         ("+", v_idx[0], v_idx[0], v_tmp3[0]),
@@ -531,19 +528,14 @@ class KernelBuilder:
 
                 # Index update for last
                 body.append({"valu": [
-                    ("%", v_tmp1[0], v_val[0], v_two), ("*", v_idx[0], v_idx[0], v_two),
-                    ("%", v_tmp1[1], v_val[1], v_two), ("*", v_idx[1], v_idx[1], v_two),
-                    ("%", v_tmp1[2], v_val[2], v_two), ("*", v_idx[2], v_idx[2], v_two),
+                    ("&", v_tmp1[0], v_val[0], v_one), ("*", v_idx[0], v_idx[0], v_two),
+                    ("&", v_tmp1[1], v_val[1], v_one), ("*", v_idx[1], v_idx[1], v_two),
+                    ("&", v_tmp1[2], v_val[2], v_one), ("*", v_idx[2], v_idx[2], v_two),
                 ]})
                 body.append({"valu": [
-                    ("==", v_tmp1[0], v_tmp1[0], v_zero),
-                    ("==", v_tmp1[1], v_tmp1[1], v_zero),
-                    ("==", v_tmp1[2], v_tmp1[2], v_zero),
-                ]})
-                body.append({"valu": [
-                    ("-", v_tmp3[0], v_two, v_tmp1[0]),
-                    ("-", v_tmp3[1], v_two, v_tmp1[1]),
-                    ("-", v_tmp3[2], v_two, v_tmp1[2]),
+                    ("+", v_tmp3[0], v_one, v_tmp1[0]),
+                    ("+", v_tmp3[1], v_one, v_tmp1[1]),
+                    ("+", v_tmp3[2], v_one, v_tmp1[2]),
                 ]})
                 body.append({"valu": [
                     ("+", v_idx[0], v_idx[0], v_tmp3[0]),
@@ -620,11 +612,10 @@ class KernelBuilder:
                 ]})
 
                 body.append({"valu": [
-                    ("%", v_tmp1[0], v_val[0], v_two),
+                    ("&", v_tmp1[0], v_val[0], v_one),
                     ("*", v_idx[0], v_idx[0], v_two),
                 ]})
-                body.append({"valu": [("==", v_tmp1[0], v_tmp1[0], v_zero)]})
-                body.append({"valu": [("-", v_tmp3[0], v_two, v_tmp1[0])]})
+                body.append({"valu": [("+", v_tmp3[0], v_one, v_tmp1[0])]})
                 body.append({"valu": [("+", v_idx[0], v_idx[0], v_tmp3[0])]})
                 body.append({"debug": [
                     ("vcompare", v_idx[0], tuple((round, batch_base + j, "next_idx") for j in range(VLEN)))
